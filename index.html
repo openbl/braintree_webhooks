@@ -1,0 +1,513 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>Title</title>
+    <meta http-equiv="Content-Type" content="text/html; charset=UTF-8"/>
+    <style type="text/css">
+      @import url(https://fonts.googleapis.com/css?family=Yanone+Kaffeesatz);
+      @import url(https://fonts.googleapis.com/css?family=Droid+Serif:400,700,400italic);
+      @import url(https://fonts.googleapis.com/css?family=Ubuntu+Mono:400,700,400italic);
+
+      body { font-family: 'Droid Serif'; }
+      h1, h2, h3 {
+        font-family: 'Yanone Kaffeesatz';
+        font-weight: normal;
+      }
+      .remark-code, .remark-inline-code { font-family: 'Ubuntu Mono'; }
+    </style>
+  </head>
+  <body>
+    <textarea id="source">
+
+class: center, middle
+
+# Webhooks @ Braintree
+
+???
+
+* Thank you everyone for making it to my talk
+* I'm Brian, a developer at Braintree Payments
+* Tonight I want to talk to you about webhooks
+* I imagine many of you have and use webhooks in applications that you work with
+* They're a powerful way to allow 3rd party services to initiate communication with your systems
+* Our merchants use our webhooks in order be alerted to and respond to changes in state within the Braintree system
+* But I'm getting ahead of myself...
+
+---
+
+# Webhooks @ Braintree
+
+* Webhooks Overview
+* Evented Web Servers
+* Webhook Worker
+* Problems
+
+???
+
+* In the next x minutes I plan to give you an overview of what webhooks are and how we use them at Braintree
+* Getting into the details of our webhook worker, I'll briefly talk about th
+* I'll cover the evented-web framework that we use to serve up webhooks
+* Finally, I'll share with you some of the problems that we've had with our approach
+
+---
+
+# Webhooks Overview
+
+* Simply Callbacks
+* Triggered by an Event
+* Consumers can Consume
+
+???
+
+* webhooks are simply http callbacks
+* they're triggered by an event within our system
+  * i'll get into some of those in just a minute
+* merchants can consume these callbacks to trigger events within their system
+
+---
+
+# Webhooks Overview: Events
+
+* Subscriptions
+* Disbursement
+* Partners
+* Marketplace/Sub Merchants
+
+[Webhook Triggers](https://developers.braintreepayments.com/javascript+python/sdk/server/webhooks/triggers)
+
+???
+
+* Much like DOM elements in a browser, our domain objects have events that can happen asynchronously
+* These events can trigger a webhook if enabled
+
+* Subscriptions
+  * Canceled
+  * Expired
+  * Trial Ended
+  * Went Past Due
+  * Charged Successfully
+  * Charged Unsuccessfully
+  * Went Active
+* Transactions
+  * Disbursement
+  * Disbursed (deprecated)
+* Partners
+  * Connected
+  * Declined
+  * Disconnected
+* Marketplace/Sub Merchants
+  * Approved
+  * Declined
+  * Disbursement Exception
+
+---
+
+# Webhooks Overview: Details
+
+* Domain Object's Event Occurs
+* Message is Produced & Enqueued
+* Webhook Worker Consumes Message
+* Webhook POSTed
+* Merchant Receives & Verifies
+
+???
+
+* let's take a subscription for example
+* and assume a merchant has enabled subscription charge successfully webhooks
+* if it has a billing day of today, then it will be charged
+* and a successfully charged webhook will be enqueued to be sent out
+* once the webhook worker is able to send out the next request, it consumes it off of the queue
+* and POSTs it to the endpoint the merchant has configured
+* Once received, the merchant should verify the message's signature and can take whatever action is needed
+
+---
+
+# Webhooks Overview: Architecture
+
+* Gateway/Peripheral Applications/Banks
+* Queue (RabbitMQ)
+* Webhook Worker
+* Merchant Server
+
+???
+
+* If our recurring billing background job successfully charges a subscription,
+* if a marketplace sub merchant or partner merchants is approved,
+* or if a merchant had disbursed transaction, the gateway with enqueue a message to send via a webhook
+* The webhook worker consumes the message to be sent
+* Finally the merchant server successfully receives the message
+
+---
+
+# Webhooks Overview: Webhook Worker
+
+* Consumes messages from queue
+* POSTs message to merchant's endpoint
+* ACKs message off queue if POSTed successful (2xx)
+* ACKs but requeues with 1 hour delay if unsuccessful
+* Drops message after 24 hours of trying (once an hour)
+
+???
+
+* It does all of this but for 100s if not 1000s of simultaneous webhook requests
+* [Transition] How is it able to do this?
+
+---
+
+# Evented Web Server
+
+* Web Server
+* Single-Threaded
+* Non-blocking
+
+???
+
+* Tornado is an evented, non-blocking web server that runs in a single thread
+* Running in a single thread doesn't mean it's truly non-blocking requests
+* But non-blocking I/O
+* Our webhook requests are I/O bound, mostly waiting for a request from the merchant's endpoint
+* Our webhooks are not CPU bound; the application code keeps track of request rates to prevent us from
+
+---
+
+# Evented Web Server: Non-blocking I/O
+
+* `select`
+* `epoll` (Linux)
+* `kqueue` (BSD)
+
+[Working with TCP Sockets by Jesse Storimer](http://www.jstorimer.com/products/working-with-tcp-sockets)
+
+???
+
+* I'm going to quickly walk down the stack before talking about the traditional architecture of an evented web server
+* I mentioned non-blocking I/O but what is that?
+* Modern operating systems have to deal with concurrency and give the application the ability to do other work while waiting on IO
+* Select is the oldest of the three, returning the status of an open IO file handler
+* Epoll, a Linux kernel call, is a more performant way to query the status of IO
+* Kqueue, is the BSD-equivilent to epoll
+* When any of the IO file handlers have something to read or write then the file handler will be returned from the call to be used
+* I'll show you how this fits into the system as a whole
+
+___
+
+# Evented Web Server
+
+*   Resources
+  *   Socket/HTTP connections
+*   Synchronous event demultiplexer
+  *   Main IO loop
+*   Dispatcher
+  *   Un/register and call handlers
+*   Request handler
+  * "Synchronous" callback code
+
+???
+
+* An evented web server typically is comprised of 4 elements
+* resources, a event demultiplexer, a dispatcher, and request handlers
+* resources are IO file handles, for our webhoook worker pending webhook requests and the connection to rabbit
+* the event demultiplexer is the main io loop. it yields time to IO that's ready to be read from or written to
+* the dispatcher is what registers and unregisters resources with a callback and invokes the call handler when the resource is ready
+* the request handler is the synchronous callback code that one writes for the Event Web Server
+* tornado has ways of decorating these methods to be used asynchronously
+
+---
+
+# Evented Web Server: Main Goal
+
+* DON'T BLOCK THE EVENT LOOP!!!
+* [Async HTTP Client](http://tornado.readthedocs.org/en/branch2.2/httpclient.html#tornado.httpclient.AsyncHTTPClient)
+* [Tasks](http://www.tornadoweb.org/en/stable/gen.html#tornado.gen.engine)
+* [Futures](http://www.tornadoweb.org/en/stable/gen.html#tornado.gen.coroutine)
+
+???
+
+* The event loop is basically a for loop querying the OS for the status of open IO resources
+* When our webhook worker makes an outbound request to a merchant's endpoint, it uses this call
+  * the code that used the client waits for the response before continuing
+* Consuming, acknowledging, and requeuing messages to Rabbit is accomplished through Pika's Tornado adapter
+  * Pika will just continually check for new messages to consume, reading as much as it can
+* Tornado has ways of abstracting asynchronous code with Tasks and Futures
+  * Futures are the conventional way now
+  * we used Tasks to abstract the calls to the merchant endpoints
+  * this allows us to worry about retrying and requeueing on a different level
+
+---
+
+# Webhook Worker
+
+* Setup Connection with Rabbit
+* Send Webhooks and Acknowledge
+* Retry Every Hour
+* Give Up after 24 hours
+
+???
+
+* So how do we do all of this with Tornado?
+* Let's walk through the flow of first how the worker is initialized
+* Then how a message is sent and any subsequent retry
+
+---
+
+# Webhook Worker: Startup
+
+* IO Loop Starts
+
+```python
+io_loop = tornado.ioloop.IOLoop.instance()
+
+worker = webhook_worker.Worker(
+    io_loop=io_loop
+    queue_name=args.queue_name,
+    stats_collector=stats_collector,
+    rabbitmq_host=args.rabbitmq_host,
+    rabbitmq_port=args.rabbitmq_port,
+    destination_wait=args.destination_wait,
+    http_timeout=args.http_timeout)
+
+worker.start()
+
+io_loop.start()
+```
+
+---
+
+# Webhook Worker: Worker Startup
+
+* Worker starts the clients
+* Worker registers a callback for message consumption
+
+```python
+class Worker(object):
+
+    def __init__(self, io_loop,
+                 queue_name, rabbitmq_host, rabbitmq_port,
+                 destination_wait, http_timeout):
+        # initializes the Rabbit and HTTP Clients
+
+    @tornado.gen.engine
+    def start(self):
+        syslogger.warn("Starting worker")
+        yield tornado.gen.Task(self.client.start)
+        self.client.consume(self._receive_from_queue)
+```
+
+---
+
+# Webhook Worker: Client Startup
+
+* Initializes Rabbit Client
+* Builds the Client Connection
+
+```python
+class Client(object):
+
+    @tornado.gen.engine
+    def start(self, callback):
+        yield tornado.gen.Task(self._build_pika_client)
+        callback()
+
+    @tornado.gen.engine
+    def _build_pika_client(self, callback):
+        self.connection = yield tornado.gen.Task(self._build_connection)
+        self.channel = yield tornado.gen.Task(self._build_channel, self.connection)
+        self.queue = yield tornado.gen.Task(self.channel.queue_declare, \
+            queue=self.queue_name, durable=True, arguments={"x-ha-policy":"all"})
+        callback()
+```
+
+???
+
+* the initialization of the Rabbit client is basically an abstraction around the setup of the rabbit connect, channel and queue
+* as you see this is accomplished by the use of Tornado's Tasks
+* the invokation of `callback()` tells Tornado this call is complete
+  * if any parameters were passed then they would be returned from the yield call
+  * as you see in `client.start`
+
+---
+
+# Webhook Worker: Consuming
+
+* Pika Connection is non-blocking
+* Consume calls Pika's `basic_consume`
+* `self._handle_consume(callback)` returns consumer handler
+
+```python
+class Client(object):
+
+    def consume(self, callback):
+        self.channel.basic_consume(
+            consumer_callback=self._handle_consume(callback),
+            queue=self.queue_name)
+```
+
+---
+
+# Webhook Worker: Sending Webhooks
+
+* tornado.httpclient sends the request
+* `yield`s until a response
+
+
+```python
+class Worker(object):
+
+    @tornado.gen.engine
+    def _receive_from_queue(self, message):
+        syslogger.info("Receiving message from queue", message.id)
+        # ...
+        request = tornado.httpclient.HTTPRequest(...)
+
+        http_request_logline = "Sending HTTP request ..."
+        syslogger.info(http_request_logline, message.id)
+
+        response = yield tornado.gen.Task(self.http_client.fetch, request)
+        self._handle_http_response(response, message)
+```
+
+---
+
+# Webhook Worker: Rate Limiting
+
+* Worker tracks endpoints next request time
+* Staggers requests to a single endpoint
+* Timeout causes request to wait
+
+```python
+class Worker(object):
+
+    @tornado.gen.engine
+    def _receive_from_queue(self, message):
+        syslogger.info("Receiving message from queue", message.id)
+
+        next_request_time = self.minimum_next_request_times[message.destination]
+        self.minimum_next_request_times[message.destination] = \
+            max(next_request_time, time.time()) + self.destination_wait
+
+        syslogger.info("Will request at %s" % [next_request_time], message.id)
+
+        yield tornado.gen.Task(self.io_loop.add_timeout, next_request_time)
+        # ...
+```
+
+---
+
+# Webhook Worker: Acknowledgement
+
+```python
+class Worker(object):
+
+    def _ack(self, message):
+        syslogger.info("Acking", message.id)
+        message.ack()
+
+    def _handle_http_response(self, response, message):
+        syslogger.info("Processing HTTP response", message.id)
+        if 200 <= response.code < 300:
+            self._ack(message)
+        else:
+            # ...
+```
+
+---
+
+# Webhook Worker: Retry
+
+* If < 24 attempts
+  * Acknowledges original message
+  * Requeues message with incremented failure count
+* If >= 24 attempts
+  * Acknowledges original message
+  * Doesn't requeue
+
+---
+
+# Webhook Worker: Retry
+
+```python
+class Worker(object):
+
+    def _handle_http_response(self, response, message):
+        syslogger.info("Processing HTTP response", message.id)
+        if 200 <= response.code < 300:
+            # ...
+        else:
+            http_error_logline = "Received ..."
+            syslogger.info(http_error_logline, message.id)
+            syslogger.info("Requeuing", message.id)
+            self._requeue_message(message)
+
+    @tornado.gen.engine
+    def _requeue_message(self, message):
+        message.increment_failure_count()
+        if message.should_retry:
+            yield tornado.gen.Task(self.io_loop.add_timeout, \
+                time.time() + message.retry_delay)
+            self.client.produce(message.body, headers=message.headers)
+        else:
+            syslogger.err("Giving up retrying", message.id)
+
+        self._ack(message)
+```
+
+---
+
+# Problems
+
+* Callbacks
+* AMQP Heartbeats
+* Tornado HTTPClient Limit
+* Endpoint Verification in Ruby
+* Python 2 & SNI
+
+---
+
+# Problems: Callbacks
+
+* Deceivingly synchronous-looking code
+* Logging was inconsistent
+* Callbacks difficult to follow
+
+---
+
+# Problems: AMQP Heartbeat
+
+* AMQP heartbeat timeouts caused the Pika to raise without being caught
+* Disabled heartbeat since traffic maintains connection
+
+---
+
+# Problems: HTTPClient Limit
+
+* A large number of webhook messages to a handful of merchants with slow endpoints
+* Tornado's HTTP Client defaults to 10 concurrent connections
+* These 2 things coupled caused the event loop not to be able to queue up more outbound connections
+
+---
+
+# Problems: Endpoint Verification in Ruby
+
+* Gateway in Ruby
+* Verification of Subdomains Different from Python
+
+---
+
+# Problems: Python 2 & SNI
+
+* Python 2 doesn't support SNI
+* We don't support webhooks via HTTPS to different hostnames on the same IP
+* Moving to Python 3 for support
+
+---
+
+# Thank You
+
+    </textarea>
+    <script src="js/remark-latest.min.js" type="text/javascript">
+    </script>
+    <script type="text/javascript">
+      var slideshow = remark.create();
+    </script>
+  </body>
+</html>
